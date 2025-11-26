@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/workspace/hairong/code/Rex-Omni/finetuning/work_dirs/ovigod_grpo_sft_5ep_4rollouts/global_step_836/actor/huggingface",
+  "ensemble_config": {
+    "n_samples": 4,
+    "vote_threshold": 0.4,
+    "iou_threshold": 0.4,
+    "temperature": 1.0
+  },
+  "test_samples": 2630,
+  "total_gt": 12185,
+  "ensemble_stats": {
+    "avg_boxes_before_vote": 17.07115531752104,
+    "avg_boxes_after_vote": 4.227620504973221,
+    "filtering_ratio": 0.2476470060953747
+  },
+  "metrics": {
+    "AP@50": 0.6170817132424113,
+    "AP@75": 0.42550048327586143,
+    "AP@50:95": 0.40565169553998687
+  },
+  "detailed_aps": {
+    "AP@0.50": 0.6170817132424113,
+    "AP@0.55": 0.5937352396231094,
+    "AP@0.60": 0.5630772123810911,
+    "AP@0.65": 0.5252986785529585,
+    "AP@0.70": 0.4812270542836292,
+    "AP@0.75": 0.42550048327586143,
+    "AP@0.80": 0.3552021152149698,
+    "AP@0.85": 0.27145986256575705,
+    "AP@0.90": 0.16848995459176747,
+    "AP@0.95": 0.055444641668313206
+  }
+}

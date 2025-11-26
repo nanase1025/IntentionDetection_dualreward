@@ -6,8 +6,6 @@ import os
 from base64 import b64decode
 from io import BytesIO
 
-import numpy as np
-from mmengine import Config
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 from tqdm import tqdm

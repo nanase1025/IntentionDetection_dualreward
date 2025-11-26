@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/workspace/hairong/code/Rex-Omni/finetuning/work_dirs/ovigod_sft_5ep",
+  "ensemble_config": {
+    "n_samples": 4,
+    "vote_threshold": 0.5,
+    "iou_threshold": 0.5,
+    "temperature": 1.0
+  },
+  "test_samples": 2630,
+  "total_gt": 12185,
+  "ensemble_stats": {
+    "avg_boxes_before_vote": 17.330254041570438,
+    "avg_boxes_after_vote": 4.264049268668206,
+    "filtering_ratio": 0.246046552949538
+  },
+  "metrics": {
+    "AP@50": 0.6262927942486853,
+    "AP@75": 0.44312522256545267,
+    "AP@50:95": 0.41579746845948823
+  },
+  "detailed_aps": {
+    "AP@0.50": 0.6262927942486853,
+    "AP@0.55": 0.6036807572267562,
+    "AP@0.60": 0.5766486844232216,
+    "AP@0.65": 0.5393180467385374,
+    "AP@0.70": 0.4988558989748585,
+    "AP@0.75": 0.44312522256545267,
+    "AP@0.80": 0.3656619771006634,
+    "AP@0.85": 0.2777712743562851,
+    "AP@0.90": 0.17009485709279748,
+    "AP@0.95": 0.05652517186762516
+  }
+}

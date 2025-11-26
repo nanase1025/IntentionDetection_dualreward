@@ -201,9 +201,22 @@ def train(attn_implementation="flash_attention_2"):
     trainer.save_state()
     data_args.image_processor.save_pretrained(training_args.output_dir)
 
-    source_path = os.path.join(model_args.model_name_or_path, "chat_template.json")
-    template_path = os.path.join(training_args.output_dir, "chat_template.json")
-    shutil.copy2(source_path, template_path)
+    # Copy chat_template.json if it exists
+    try:
+        # Try to find chat_template.json in model cache or local path
+        if os.path.exists(os.path.join(model_args.model_name_or_path, "chat_template.json")):
+            source_path = os.path.join(model_args.model_name_or_path, "chat_template.json")
+        else:
+            # Try to find in huggingface cache
+            from huggingface_hub import hf_hub_download
+            source_path = hf_hub_download(repo_id=model_args.model_name_or_path, filename="chat_template.json")
+        
+        template_path = os.path.join(training_args.output_dir, "chat_template.json")
+        shutil.copy2(source_path, template_path)
+        rank0_print(f"Copied chat_template.json to {template_path}")
+    except Exception as e:
+        rank0_print(f"Warning: Could not copy chat_template.json: {e}")
+        rank0_print("This is not critical, the model can still be used.")
 
     model.config.use_cache = True
 

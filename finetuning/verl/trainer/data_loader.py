@@ -55,11 +55,12 @@ def create_dataloader(
         dataset=train_dataset,
         batch_size=config.rollout_batch_size,
         sampler=sampler,
-        num_workers=8,
+        num_workers=config.num_workers,  # Use configurable num_workers (0 = main process, >0 = multiprocessing)
         collate_fn=collate_fn,
         pin_memory=False,
         drop_last=True,
     )
 
     print(f"Size of train dataloader: {len(train_dataloader)}")
+    print(f"DataLoader num_workers: {config.num_workers} ({'main process' if config.num_workers == 0 else f'{config.num_workers} workers'})")
     return train_dataloader, None

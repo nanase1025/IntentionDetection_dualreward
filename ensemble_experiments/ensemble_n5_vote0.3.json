@@ -1,0 +1,33 @@
+{
+  "checkpoint": "finetuning/work_dirs/ovigod_grpo_resume/global_step_500/actor/huggingface",
+  "ensemble_config": {
+    "n_samples": 5,
+    "vote_threshold": 0.3,
+    "iou_threshold": 0.5,
+    "temperature": 1.0
+  },
+  "test_samples": 100,
+  "total_gt": 400,
+  "ensemble_stats": {
+    "avg_boxes_before_vote": 19.68,
+    "avg_boxes_after_vote": 4.13,
+    "filtering_ratio": 0.20985772357723578
+  },
+  "metrics": {
+    "AP@50": 0.8190952594172389,
+    "AP@75": 0.7041392014973628,
+    "AP@50:95": 0.6200325488847938
+  },
+  "detailed_aps": {
+    "AP@0.50": 0.8190952594172389,
+    "AP@0.55": 0.807781826793375,
+    "AP@0.60": 0.7927583160724954,
+    "AP@0.65": 0.7657596520910278,
+    "AP@0.70": 0.7356237820084531,
+    "AP@0.75": 0.7041392014973628,
+    "AP@0.80": 0.6303055618563043,
+    "AP@0.85": 0.5020358238210905,
+    "AP@0.90": 0.3333450698686862,
+    "AP@0.95": 0.10948099542190398
+  }
+}

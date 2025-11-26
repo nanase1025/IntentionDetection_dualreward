@@ -1,0 +1,92 @@
+data:
+  config_path: configs/grpo_ovigod.py
+  max_prompt_length: 4096
+  max_response_length: 4096
+  rollout_batch_size: 16  # Reduced for single GPU
+  val_batch_size: 8       # Reduced for single GPU
+  format_prompt: verl/configs/r1v_format.jinja
+  override_chat_template: null
+  shuffle: true
+  seed: 42
+  max_pixels: 1003520  # 2560 * 28 * 28 / 2
+  min_pixels: 12544    # 16 * 28 * 28
+  filter_overlong_prompts: true
+  num_workers: 16  # Number of data loading workers (0=main process, 2-8 recommended for parallel loading)
+
+algorithm:
+  adv_estimator: grpo  # GRPO algorithm
+  disable_kl: false
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 5.0e-3  # Slightly lower KL coefficient
+
+worker:
+  actor:
+    global_batch_size: 16  # Reduced for single GPU
+    micro_batch_size_per_device_for_update: 2
+    micro_batch_size_per_device_for_experience: 4
+    max_grad_norm: 1.0
+    padding_free: true
+    ulysses_sequence_parallel_size: 1
+    model:
+      model_path: work_dirs/ovigod_sft/checkpoint-627  # Your best SFT checkpoint
+      enable_gradient_checkpointing: true
+      trust_remote_code: true
+      freeze_vision_tower: false  # Keep vision tower trainable
+    optim:
+      lr: 5.0e-7  # Lower learning rate for RL fine-tuning
+      weight_decay: 1.0e-2
+      strategy: adamw
+      lr_warmup_ratio: 0.1 #0.0 for resume training
+    fsdp:
+      enable_full_shard: false  # Disabled for single GPU
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false  # No offload needed for single GPU
+      offload_optimizer: false
+
+  rollout:
+    n: 4  # Number of rollouts per prompt (reduced for single GPU)
+    temperature: 1.0
+    top_p: 0.95
+    gpu_memory_utilization: 0.7  # Leave room for training
+    enforce_eager: false
+    enable_chunked_prefill: true
+    tensor_parallel_size: 1  # Single GPU
+    max_num_batched_tokens: 8192  # Reduced for single GPU
+    limit_images: 1
+    val_override_config:
+      temperature: 0.5
+      n: 1
+
+  ref:
+    fsdp:
+      enable_full_shard: false  # Disabled for single GPU
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+
+  reward:
+    reward_type: batch
+    reward_function: verl/configs/reward_func.py:compute_score
+    skip_special_tokens: false
+
+trainer:
+  total_epochs: 1
+  max_steps: null
+  project_name: rex_omni_grpo
+  experiment_name: ovigod_affordance_grpo
+  logger: ["console", "wandb"]
+  nnodes: 1
+  n_gpus_per_node: 1  # Single GPU training
+  val_freq: -1  # Disable validation for faster training
+  val_before_train: false
+  val_only: false
+  val_generations_to_log: 3
+  save_freq: 50  # Save every 50 steps
+  save_limit: 3  # Keep only 3 latest checkpoints
+  save_checkpoint_path: work_dirs/ovigod_grpo
+  load_checkpoint_path: null  # Will load from actor.model.model_path
+
