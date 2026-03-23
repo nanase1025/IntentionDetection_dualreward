@@ -782,6 +782,1266 @@ RewardFunctionFactory.register("point_in_box", PointInBoxRewardFunction)
 RewardFunctionFactory.register("point_in_mask", PointInMaskRewardFunction)
 
 
+class DualRewardFunction(BaseRewardFunction):
+    """
+    Dual Reward Function: Combines IoU (position) and CLIP (semantic) rewards
+    
+    This reward function evaluates predictions based on two criteria:
+    1. IoU: Position accuracy (how well the bbox overlaps with ground truth)
+    2. CLIP: Semantic relevance (how well the predicted region matches the intention query)
+    """
+    
+    _clip_model = None  # Class variable to share CLIP model across instances
+    _clip_processor = None
+    
+    def __init__(self):
+        """Initialize Dual Reward Function and load CLIP model if needed"""
+        super().__init__()
+        
+        # Configuration (can be adjusted via environment variables)
+        self.alpha = float(os.getenv("DUAL_REWARD_ALPHA", "0.5"))  # IoU weight
+        self.beta = float(os.getenv("DUAL_REWARD_BETA", "0.5"))    # CLIP weight
+        self.iou_threshold = float(os.getenv("DUAL_REWARD_IOU_THRESHOLD", "0.5"))
+        # FG-CLIP v1 Long Text Mode threshold: 15.0 (empirically tested on COCO outdoor)
+        # Balanced accuracy ~62% at this threshold
+        self.clip_threshold = float(os.getenv("DUAL_REWARD_CLIP_THRESHOLD", "15.0"))
+        
+        # Load CLIP model (shared across instances)
+        if DualRewardFunction._clip_model is None:
+            self._load_clip_model()
+    
+    def _load_clip_model(self):
+        """Load FG-CLIP v1 model (only once, shared across instances)"""
+        try:
+            import torch
+            from transformers import (
+                AutoImageProcessor,
+                AutoTokenizer,
+                AutoModelForCausalLM,  # FG-CLIP needs this instead of AutoModel
+            )
+            
+            # Use FG-CLIP v1 by default
+            clip_model_name = os.getenv("CLIP_MODEL_NAME", "qihoo360/fg-clip-large")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Loading FG-CLIP v1 model: {clip_model_name} on {device}")
+            
+            # Load FG-CLIP v1 model (requires AutoModelForCausalLM due to custom config)
+            DualRewardFunction._clip_model = AutoModelForCausalLM.from_pretrained(
+                clip_model_name, 
+                trust_remote_code=True
+            ).to(device)
+            
+            DualRewardFunction._clip_processor = {
+                'tokenizer': AutoTokenizer.from_pretrained(clip_model_name),
+                'image_processor': AutoImageProcessor.from_pretrained(clip_model_name),
+                'is_fgclip_v1': True
+            }
+            
+            DualRewardFunction._clip_model.eval()
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"✅ FG-CLIP v1 model loaded successfully")
+                
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to load FG-CLIP v1 model: {e}")
+            print("   Falling back to pure IoU reward")
+            DualRewardFunction._clip_model = None
+            DualRewardFunction._clip_processor = None
+    
+    def get_reward_name(self) -> str:
+        return "dual"
+    
+    def compute_iou(self, box1: List[float], box2: List[float]) -> float:
+        """Calculate IoU between two boxes"""
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+        inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+        
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area == 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
+    def compute_clip_score(self, image_data: str, bbox: List[float], query: str, width: int, height: int) -> float:
+        """
+        Compute FG-CLIP v1 similarity score between cropped image region and query text
+        
+        Args:
+            image_data: Base64 encoded image string
+            bbox: Predicted bounding box [x0, y0, x1, y1]
+            query: Intention query text
+            width: Image width
+            height: Image height
+            
+        Returns:
+            Similarity score (continuous value)
+            - FG-CLIP v1 Long Text Mode: logit_scale.exp() * cosine_similarity
+            - Typical range for v1: ~5-25, threshold=15.0 for binary reward
+        """
+        if DualRewardFunction._clip_model is None or DualRewardFunction._clip_processor is None:
+            return -1.0  # Return negative to indicate failure
+        
+        try:
+            import torch
+            
+            # Decode image
+            img_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((width, height))
+            
+            # Crop predicted region
+            x0, y0, x1, y1 = bbox
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(width, int(x1)), min(height, int(y1))
+            
+            if x0 >= x1 or y0 >= y1:
+                return -1.0  # Invalid bbox
+            
+            cropped = img.crop((x0, y0, x1, y1))
+            
+            # Check if using FG-CLIP v1
+            is_fgclip_v1 = DualRewardFunction._clip_processor.get('is_fgclip_v1', False)
+            
+            with torch.no_grad():
+                if is_fgclip_v1:
+                    # FG-CLIP v1 pathway (Long Text Mode)
+                    tokenizer = DualRewardFunction._clip_processor['tokenizer']
+                    image_processor = DualRewardFunction._clip_processor['image_processor']
+                    device = next(DualRewardFunction._clip_model.parameters()).device
+                    
+                    # FG-CLIP v1 uses fixed resolution (336x336 for large model)
+                    image_size = int(os.getenv("FGCLIP_IMAGE_SIZE", "336"))
+                    cropped_resized = cropped.resize((image_size, image_size))
+                    
+                    # Process image with FG-CLIP v1 API
+                    image_input = image_processor.preprocess(
+                        cropped_resized, 
+                        return_tensors='pt'
+                    )['pixel_values'].to(device)
+                    
+                    # Long caption mode: max_length=248, walk_short_pos=False
+                    use_long_text = os.getenv("FGCLIP_USE_LONG_TEXT", "true").lower() == "true"
+                    if use_long_text:
+                        max_length = 248
+                        walk_short_pos = False
+                    else:
+                        max_length = 77
+                        walk_short_pos = True
+                    
+                    caption_input = torch.tensor(
+                        tokenizer([query], max_length=max_length, padding="max_length", truncation=True).input_ids,
+                        dtype=torch.long,
+                        device=device
+                    )
+                    
+                    # Get features
+                    image_feature = DualRewardFunction._clip_model.get_image_features(image_input)
+                    text_feature = DualRewardFunction._clip_model.get_text_features(
+                        caption_input, 
+                        walk_short_pos=walk_short_pos
+                    )
+                    
+                    # Normalize
+                    image_feature = image_feature / image_feature.norm(p=2, dim=-1, keepdim=True)
+                    text_feature = text_feature / text_feature.norm(p=2, dim=-1, keepdim=True)
+                    
+                    # Compute similarity with logit_scale (FG-CLIP v1)
+                    logits_per_image = image_feature @ text_feature.T
+                    logit_scale = DualRewardFunction._clip_model.logit_scale
+                    similarity = (logit_scale.exp() * logits_per_image).squeeze().item()
+                    
+                else:
+                    # Fallback: Should not reach here with current config
+                    return -1.0
+                
+            return similarity
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Warning: CLIP/FG-CLIP computation failed: {e}")
+                import traceback
+                traceback.print_exc()
+            return -1.0
+    
+    def parse_ground_truth(self, ground_truth: str) -> Optional[Dict]:
+        """Parse ground truth (reuse BoxIoU logic)"""
+        answer = ground_truth["answer"]
+        resized_size = ground_truth["resized_image_size"]
+        width, height = resized_size
+        
+        objects = {}
+        for class_name, class_data in answer.items():
+            if "boxes" in class_data:
+                objects[class_name] = class_data["boxes"]
+        
+        # Extract image data and intention query
+        image_data = ground_truth.get("image", None)
+        intention_query = ground_truth.get("intention_query", "")
+        
+        return {
+            "dims": (width, height),
+            "objects": objects,
+            "raw_data": answer,
+            "image": image_data,
+            "intention_query": intention_query
+        }
+    
+    def parse_detection_output(self, text: str, width: int, height: int) -> Optional[Dict]:
+        """Parse model output (reuse BoxIoU logic)"""
+        try:
+            text = text.replace("\n", "").strip()
+            objects = {}
+            pattern = (
+                r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|>"
+                r"<\|box_start\|>(.*?)<\|box_end\|>"
+            )
+            
+            matches = re.findall(pattern, text)
+            
+            for class_name, boxes_str in matches:
+                class_name = class_name.strip()
+                if class_name not in objects:
+                    objects[class_name] = []
+                
+                box_pattern = r"<(\d+)>"
+                all_coords = re.findall(box_pattern, boxes_str)
+                
+                for i in range(0, len(all_coords), 4):
+                    if i + 3 < len(all_coords):
+                        try:
+                            x1, y1, x2, y2 = [int(coord) for coord in all_coords[i:i+4]]
+                            x1_abs = x1 / 1000.0 * width
+                            y1_abs = y1 / 1000.0 * height
+                            x2_abs = x2 / 1000.0 * width
+                            y2_abs = y2 / 1000.0 * height
+                            
+                            x1_final = min(x1_abs, x2_abs)
+                            y1_final = min(y1_abs, y2_abs)
+                            x2_final = max(x1_abs, x2_abs)
+                            y2_final = max(y1_abs, y2_abs)
+                            
+                            if x1_final < x2_final and y1_final < y2_final:
+                                objects[class_name].append([x1_final, y1_final, x2_final, y2_final])
+                        except (ValueError, IndexError):
+                            continue
+            
+            return {"objects": objects}
+        except Exception:
+            return None
+    
+    def compute_reward(self, predict: str, ground_truth: str) -> float:
+        """
+        Compute Dual Reward = alpha * IoU_F1 + beta * CLIP_binary_reward
+        
+        IoU uses F1 score (continuous 0-1) based on Precision and Recall
+        CLIP uses binary reward (1.0 if score > threshold, else 0.0)
+        
+        Returns:
+            Combined reward score (continuous, range depends on alpha/beta)
+        """
+        # Parse ground truth
+        gt_data = self.parse_ground_truth(ground_truth)
+        if gt_data is None:
+            if os.getenv("DEBUG_MODE") == "true":
+                log_path = os.getenv("LOG_PATH")
+                current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"------------- Dual Reward: Failed to parse GT -------------\n")
+                    f.write(f"GT: {ground_truth}\n")
+                    f.write(f"Prediction: {predict}\n\n")
+            return 0.0
+        
+        width, height = gt_data["dims"]
+        
+        # Parse prediction
+        pred_data = self.parse_detection_output(predict, width, height)
+        if pred_data is None:
+            return 0.0
+        
+        gt_objects = gt_data["objects"]
+        pred_objects = pred_data["objects"]
+        
+        # Collect all boxes
+        all_gt_boxes = [(box, class_name) for class_name, boxes in gt_objects.items() for box in boxes]
+        all_pred_boxes = [(box, class_name) for class_name, boxes in pred_objects.items() for box in boxes]
+        
+        num_gt = len(all_gt_boxes)
+        num_pred = len(all_pred_boxes)
+        
+        # Handle edge cases
+        if num_gt == 0 and num_pred == 0:
+            return 1.0
+        if num_gt == 0 and num_pred != 0:
+            return 0.0
+        if num_pred == 0:
+            return 0.0
+        
+        # ===== Part 1: IoU Reward (F1 Score - same as BoxIoURewardFunction) =====
+        # 计算 Recall
+        total_recall_score = 0.0
+        for gt_box, gt_class in all_gt_boxes:
+            best_iou = 0.0
+            for pred_box, pred_class in all_pred_boxes:
+                if gt_class == pred_class:
+                    iou = self.compute_iou(gt_box, pred_box)
+                    best_iou = max(best_iou, iou)
+            total_recall_score += best_iou
+        
+        recall = total_recall_score / num_gt if num_gt > 0 else 0.0
+        
+        # 计算 Precision
+        total_precision_score = 0.0
+        for pred_box, pred_class in all_pred_boxes:
+            best_iou = 0.0
+            for gt_box, gt_class in all_gt_boxes:
+                if pred_class == gt_class:
+                    iou = self.compute_iou(pred_box, gt_box)
+                    best_iou = max(best_iou, iou)
+            total_precision_score += best_iou
+        
+        precision = total_precision_score / num_pred if num_pred > 0 else 0.0
+        
+        # 计算 F1 分数（连续值：0.0-1.0）
+        if precision + recall == 0:
+            iou_reward = 0.0
+        else:
+            iou_reward = 2 * (precision * recall) / (precision + recall)
+        
+        # ===== Part 2: CLIP Reward =====
+        clip_reward = 0.0
+        avg_clip_score = -1.0  # Initialize to -1 (failure/invalid)
+        
+        if DualRewardFunction._clip_model is not None and gt_data.get("image") and gt_data.get("intention_query"):
+            # Compute CLIP cosine similarity for the best matching prediction
+            total_clip_score = 0.0
+            valid_preds = 0
+            
+            for pred_box, pred_class in all_pred_boxes:
+                clip_score = self.compute_clip_score(
+                    gt_data["image"],
+                    pred_box,
+                    gt_data["intention_query"],
+                    width,
+                    height
+                )
+                if clip_score > -1.0:  # Valid score (cosine similarity range: -1 to 1)
+                    total_clip_score += clip_score
+                    valid_preds += 1
+            
+            avg_clip_score = total_clip_score / valid_preds if valid_preds > 0 else -1.0
+            clip_reward = 1.0 if avg_clip_score > self.clip_threshold else 0.0
+        
+        # ===== Combine Rewards =====
+        print(f"IoU F1: {iou_reward:.3f} (P={precision:.3f}, R={recall:.3f}), CLIP: {avg_clip_score:.3f} (reward={clip_reward:.1f})")
+        dual_reward = self.alpha * iou_reward + self.beta * clip_reward
+        
+        # Debug logging
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"------------- Dual Reward: {dual_reward:.3f} | Dataset: {ground_truth.get('dataset_name', 'unknown')} -------------\n")
+                f.write(f"IoU Reward (F1): {iou_reward:.3f} (Precision: {precision:.3f}, Recall: {recall:.3f})\n")
+                f.write(f"CLIP Reward: {clip_reward:.1f} (avg score: {avg_clip_score:.3f}, threshold: {self.clip_threshold})\n")
+                f.write(f"Weights: alpha={self.alpha}, beta={self.beta}\n")
+                f.write(f"Prediction: {predict}\n")
+                f.write(f"GT: {json.dumps(ground_truth['answer'])}\n\n")
+        
+        return dual_reward
+
+
+# Register dual reward function
+RewardFunctionFactory.register("dual", DualRewardFunction)
+
+
+class VLMSemanticRewardFunction(BaseRewardFunction):
+    """
+    VLM Semantic Reward Function: Uses InternVL3.5 1B for captioning + BGE M3 for similarity
+    
+    Pipeline:
+    1. Crop bbox region from image
+    2. Use InternVL3.5 1B to generate caption for the region
+    3. Use BGE M3 to compute similarity between caption and intention query
+    4. Reward = 1 if similarity > 0.5, else 0
+    """
+    
+    _vlm_model = None  # InternVL3.5 1B for captioning
+    _vlm_tokenizer = None
+    _bge_model = None  # BGE M3 for semantic similarity
+    
+    def __init__(self):
+        """Initialize VLM Semantic Reward Function"""
+        super().__init__()
+        
+        # Configuration
+        self.similarity_threshold = float(os.getenv("VLM_SIMILARITY_THRESHOLD", "0.5"))
+        
+        # Load models (shared across instances)
+        if VLMSemanticRewardFunction._vlm_model is None:
+            self._load_models()
+    
+    def _load_models(self):
+        """Load InternVL3.5 1B and BGE M3 models"""
+        try:
+            import torch
+            from transformers import AutoModel, AutoTokenizer
+            from FlagEmbedding import BGEM3FlagModel
+            
+            # Force set CUDA device to GPU 2 (user's default)
+            # This overrides Ray's worker environment
+            gpu_id = os.getenv("VLM_GPU_ID", "2")
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+            
+            print(f"🔧 Forcing CUDA_VISIBLE_DEVICES={gpu_id} for VLM reward")
+            print(f"🔍 torch.cuda.is_available() = {torch.cuda.is_available()}")
+            
+            if not torch.cuda.is_available():
+                print("⚠️  ERROR: CUDA not available even after setting CUDA_VISIBLE_DEVICES")
+                print(f"   Make sure GPU {gpu_id} exists on this machine")
+                VLMSemanticRewardFunction._vlm_model = None
+                VLMSemanticRewardFunction._bge_model = None
+                return
+            
+            device = "cuda:0"  # After setting CUDA_VISIBLE_DEVICES, it's always cuda:0
+            print(f"✅ CUDA available: {torch.cuda.get_device_name(0)}")
+            print(f"📍 Loading VLM and BGE models on GPU {gpu_id} (mapped to {device})")
+            
+            # Load InternVL3.5 1B for captioning
+            vlm_model_name = os.getenv("VLM_MODEL_NAME", "OpenGVLab/InternVL3_5-1B")
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Loading VLM model: {vlm_model_name}")
+            
+            VLMSemanticRewardFunction._vlm_tokenizer = AutoTokenizer.from_pretrained(
+                vlm_model_name, trust_remote_code=True, use_fast=False
+            )
+            VLMSemanticRewardFunction._vlm_model = AutoModel.from_pretrained(
+                vlm_model_name,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+                device_map=device,  # Use cuda:0 explicitly
+                attn_implementation="eager"  # Disable FlashAttention2
+            ).eval()
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print("✅ VLM model loaded successfully")
+            
+            # Load BGE M3 for semantic similarity using FlagEmbedding
+            bge_model_name = os.getenv("BGE_MODEL_NAME", "BAAI/bge-m3")
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Loading BGE model: {bge_model_name}")
+            
+            VLMSemanticRewardFunction._bge_model = BGEM3FlagModel(
+                bge_model_name,
+                use_fp16=True,
+                device=device  # Explicitly use cuda:0
+            )
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print("✅ BGE model loaded successfully")
+                
+        except Exception as e:
+            import traceback
+            print(f"⚠️  Warning: Failed to load models: {e}")
+            if os.getenv("DEBUG_MODE") == "true":
+                traceback.print_exc()
+            print("   VLM Semantic Reward will not work")
+            VLMSemanticRewardFunction._vlm_model = None
+            VLMSemanticRewardFunction._bge_model = None
+    
+    def get_reward_name(self) -> str:
+        return "vlm_semantic"
+    
+    @staticmethod
+    def build_transform(input_size):
+        """Build image transformation for InternVL"""
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+        
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+        
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        ])
+        return transform
+    
+    @staticmethod
+    def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+        """Find closest aspect ratio for dynamic preprocessing"""
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+    
+    @staticmethod
+    def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
+        """Dynamic preprocessing for InternVL"""
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+        
+        # Calculate target ratios
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) 
+            for i in range(1, n + 1) 
+            for j in range(1, n + 1) 
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        
+        # Find closest aspect ratio
+        target_aspect_ratio = VLMSemanticRewardFunction.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
+        
+        # Calculate target dimensions
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+        
+        # Resize and split image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        
+        return processed_images
+    
+    @staticmethod
+    def load_image_for_internvl(image, input_size=448, max_num=6):
+        """Load and preprocess image for InternVL"""
+        import torch
+        
+        transform = VLMSemanticRewardFunction.build_transform(input_size=input_size)
+        images = VLMSemanticRewardFunction.dynamic_preprocess(
+            image, image_size=input_size, use_thumbnail=True, max_num=max_num
+        )
+        pixel_values = [transform(img) for img in images]
+        pixel_values = torch.stack(pixel_values)
+        return pixel_values
+    
+    def generate_caption(self, image_data: str, bbox: List[float], width: int, height: int) -> str:
+        """
+        Generate caption for the bbox region using InternVL3.5 1B
+        
+        Args:
+            image_data: Base64 encoded image string
+            bbox: Bounding box [x0, y0, x1, y1]
+            width: Image width
+            height: Image height
+            
+        Returns:
+            Caption string
+        """
+        if VLMSemanticRewardFunction._vlm_model is None:
+            return ""
+        
+        try:
+            import torch
+            
+            # Decode and crop image
+            img_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((width, height))
+            
+            x0, y0, x1, y1 = bbox
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(width, int(x1)), min(height, int(y1))
+            
+            if x0 >= x1 or y0 >= y1:
+                return ""  # Invalid bbox
+            
+            cropped = img.crop((x0, y0, x1, y1))
+            
+            # Preprocess image for InternVL
+            pixel_values = self.load_image_for_internvl(cropped, input_size=448, max_num=6)
+            pixel_values = pixel_values.to(torch.bfloat16).cuda()
+            
+            # Generate caption using InternVL
+            question = "<image>\nDescribe what you see in this image in one sentence."
+            
+            generation_config = dict(
+                max_new_tokens=100,
+                do_sample=False,
+            )
+            
+            with torch.no_grad():
+                response = VLMSemanticRewardFunction._vlm_model.chat(
+                    VLMSemanticRewardFunction._vlm_tokenizer,
+                    pixel_values,
+                    question,
+                    generation_config
+                )
+            
+            return response.strip()
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Warning: Caption generation failed: {e}")
+            return ""
+    
+    def compute_similarity(self, caption: str, query: str) -> float:
+        """
+        Compute semantic similarity between caption and query using BGE M3
+        
+        Args:
+            caption: Generated caption
+            query: Intention query
+            
+        Returns:
+            Cosine similarity score [0, 1]
+        """
+        if VLMSemanticRewardFunction._bge_model is None or not caption or not query:
+            return 0.0
+        
+        try:
+            import numpy as np
+            
+            # Encode using BGE M3
+            caption_embedding = VLMSemanticRewardFunction._bge_model.encode(
+                [caption],
+                batch_size=1,
+                max_length=512
+            )['dense_vecs']
+            
+            query_embedding = VLMSemanticRewardFunction._bge_model.encode(
+                [query],
+                batch_size=1,
+                max_length=512
+            )['dense_vecs']
+            
+            # Compute cosine similarity
+            similarity_matrix = caption_embedding @ query_embedding.T
+            similarity = float(similarity_matrix[0, 0])
+            
+            # BGE M3 similarity is already in range [0, 1] approximately
+            return max(0.0, min(1.0, similarity))
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Warning: Similarity computation failed: {e}")
+            return 0.0
+    
+    def parse_ground_truth(self, ground_truth: str) -> Optional[Dict]:
+        """Parse ground truth (reuse DualReward logic)"""
+        answer = ground_truth["answer"]
+        resized_size = ground_truth["resized_image_size"]
+        width, height = resized_size
+        
+        objects = {}
+        for class_name, class_data in answer.items():
+            if "boxes" in class_data:
+                objects[class_name] = class_data["boxes"]
+        
+        # Extract image data and intention query
+        image_data = ground_truth.get("image", None)
+        intention_query = ground_truth.get("intention_query", "")
+        
+        return {
+            "dims": (width, height),
+            "objects": objects,
+            "raw_data": answer,
+            "image": image_data,
+            "intention_query": intention_query
+        }
+    
+    def parse_detection_output(self, text: str, width: int, height: int) -> Optional[Dict]:
+        """Parse model output (reuse DualReward logic)"""
+        try:
+            text = text.replace("\n", "").strip()
+            objects = {}
+            pattern = (
+                r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|>"
+                r"<\|box_start\|>(.*?)<\|box_end\|>"
+            )
+            
+            matches = re.findall(pattern, text)
+            
+            for class_name, boxes_str in matches:
+                class_name = class_name.strip()
+                if class_name not in objects:
+                    objects[class_name] = []
+                
+                box_pattern = r"<(\d+)>"
+                all_coords = re.findall(box_pattern, boxes_str)
+                
+                for i in range(0, len(all_coords), 4):
+                    if i + 3 < len(all_coords):
+                        try:
+                            x1, y1, x2, y2 = [int(coord) for coord in all_coords[i:i+4]]
+                            x1_abs = x1 / 1000.0 * width
+                            y1_abs = y1 / 1000.0 * height
+                            x2_abs = x2 / 1000.0 * width
+                            y2_abs = y2 / 1000.0 * height
+                            
+                            x1_final = min(x1_abs, x2_abs)
+                            y1_final = min(y1_abs, y2_abs)
+                            x2_final = max(x1_abs, x2_abs)
+                            y2_final = max(y1_abs, y2_abs)
+                            
+                            if x1_final < x2_final and y1_final < y2_final:
+                                objects[class_name].append([x1_final, y1_final, x2_final, y2_final])
+                        except (ValueError, IndexError):
+                            continue
+            
+            if not objects:
+                return None
+            
+            return {"objects": objects}
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Error parsing detection output: {e}")
+            return None
+    
+    def compute_reward(self, predict: str, ground_truth: Dict) -> Dict[str, float]:
+        """
+        Compute VLM Semantic Reward
+        
+        Returns:
+            Dictionary with reward scores for WandB reporting
+        """
+        gt_parsed = self.parse_ground_truth(ground_truth)
+        if gt_parsed is None:
+            return {"overall": 0.0, "vlm_semantic": 0.0, "similarity": 0.0}
+        
+        pred_parsed = self.parse_detection_output(predict, gt_parsed["dims"][0], gt_parsed["dims"][1])
+        if pred_parsed is None:
+            return {"overall": 0.0, "vlm_semantic": 0.0, "similarity": 0.0}
+        
+        width, height = gt_parsed["dims"]
+        image_data = gt_parsed["image"]
+        intention_query = gt_parsed["intention_query"]
+        
+        if not image_data or not intention_query:
+            return {"overall": 0.0, "vlm_semantic": 0.0, "similarity": 0.0}
+        
+        # Collect all predicted boxes
+        all_pred_boxes = []
+        for class_boxes in pred_parsed["objects"].values():
+            all_pred_boxes.extend(class_boxes)
+        
+        if not all_pred_boxes:
+            return {"overall": 0.0, "vlm_semantic": 0.0, "similarity": 0.0}
+        
+        # Process each predicted box
+        max_similarity = 0.0
+        best_caption = ""
+        
+        for bbox in all_pred_boxes:
+            # Generate caption for this bbox
+            caption = self.generate_caption(image_data, bbox, width, height)
+            
+            if caption:
+                # Compute similarity
+                similarity = self.compute_similarity(caption, intention_query)
+                
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_caption = caption
+        
+        # Binary reward based on threshold
+        reward = 1.0 if max_similarity > self.similarity_threshold else 0.0
+        
+        # Debug logging
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            if log_path:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"------------- VLM Semantic Reward: {reward:.1f} -------------\n")
+                    f.write(f"Max Similarity: {max_similarity:.3f} (threshold: {self.similarity_threshold})\n")
+                    f.write(f"Best Caption: {best_caption}\n")
+                    f.write(f"Intention Query: {intention_query}\n")
+                    f.write(f"Prediction: {predict}\n\n")
+        
+        return {
+            "overall": reward,
+            "vlm_semantic": reward,
+            "similarity": max_similarity
+        }
+
+
+# Register VLM semantic reward function
+RewardFunctionFactory.register("vlm_semantic", VLMSemanticRewardFunction)
+
+
+class IoUVLMRewardFunction(BaseRewardFunction):
+    """
+    IoU + VLM Semantic Hybrid Reward Function
+    
+    Combines:
+    1. IoU Reward: Position accuracy (binary 0 or 1)
+    2. VLM Semantic Reward: Semantic understanding via InternVL + BGE M3 (binary 0 or 1)
+    
+    Final Reward = alpha * IoU_reward + beta * VLM_reward
+    Default: alpha=0.5, beta=0.5 (equal weight)
+    """
+    
+    # Shared VLM and BGE models (same as VLMSemanticRewardFunction)
+    _vlm_model = None
+    _vlm_tokenizer = None
+    _bge_model = None
+    
+    def __init__(self):
+        """Initialize IoU + VLM Hybrid Reward Function"""
+        super().__init__()
+        
+        # Configuration (can be adjusted via environment variables)
+        self.alpha = float(os.getenv("IOU_VLM_ALPHA", "0.5"))  # IoU weight
+        self.beta = float(os.getenv("IOU_VLM_BETA", "0.5"))    # VLM weight
+        self.iou_threshold = float(os.getenv("IOU_VLM_IOU_THRESHOLD", "0.5"))
+        self.vlm_threshold = float(os.getenv("IOU_VLM_VLM_THRESHOLD", "0.5"))
+        
+        # Load VLM models (shared with VLMSemanticRewardFunction)
+        if IoUVLMRewardFunction._vlm_model is None:
+            self._load_models()
+    
+    def _load_models(self):
+        """Load InternVL3.5 1B and BGE M3 models"""
+        try:
+            import torch
+            from transformers import AutoModel, AutoTokenizer
+            from FlagEmbedding import BGEM3FlagModel
+            
+            # Force set CUDA device to GPU 2 (user's default)
+            # This overrides Ray's worker environment
+            gpu_id = os.getenv("VLM_GPU_ID", "2")
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+            
+            print(f"🔧 Forcing CUDA_VISIBLE_DEVICES={gpu_id} for IoU+VLM reward")
+            print(f"🔍 torch.cuda.is_available() = {torch.cuda.is_available()}")
+            
+            if not torch.cuda.is_available():
+                print("⚠️  ERROR: CUDA not available even after setting CUDA_VISIBLE_DEVICES")
+                print(f"   Make sure GPU {gpu_id} exists on this machine")
+                print("   IoU+VLM will fall back to pure IoU")
+                IoUVLMRewardFunction._vlm_model = None
+                IoUVLMRewardFunction._bge_model = None
+                return
+            
+            device = "cuda:0"  # After setting CUDA_VISIBLE_DEVICES, it's always cuda:0
+            print(f"✅ CUDA available: {torch.cuda.get_device_name(0)}")
+            print(f"📍 Loading VLM and BGE models on GPU {gpu_id} (mapped to {device})")
+            
+            # Load InternVL3.5 1B
+            vlm_model_name = os.getenv("VLM_MODEL_NAME", "OpenGVLab/InternVL3_5-1B")
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Loading VLM model: {vlm_model_name}")
+            
+            IoUVLMRewardFunction._vlm_tokenizer = AutoTokenizer.from_pretrained(
+                vlm_model_name, trust_remote_code=True, use_fast=False
+            )
+            IoUVLMRewardFunction._vlm_model = AutoModel.from_pretrained(
+                vlm_model_name,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+                device_map=device,  # Use cuda:0 explicitly
+                attn_implementation="eager"  # Disable FlashAttention2
+            ).eval()
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print("✅ VLM model loaded successfully")
+            
+            # Load BGE M3
+            bge_model_name = os.getenv("BGE_MODEL_NAME", "BAAI/bge-m3")
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Loading BGE model: {bge_model_name}")
+            
+            IoUVLMRewardFunction._bge_model = BGEM3FlagModel(
+                bge_model_name,
+                use_fp16=True,
+                device=device  # Explicitly use cuda:0
+            )
+            
+            if os.getenv("DEBUG_MODE") == "true":
+                print("✅ BGE model loaded successfully")
+                
+        except Exception as e:
+            import traceback
+            print(f"⚠️  Warning: Failed to load models: {e}")
+            if os.getenv("DEBUG_MODE") == "true":
+                traceback.print_exc()
+            print("   IoU+VLM Reward will fall back to pure IoU")
+            IoUVLMRewardFunction._vlm_model = None
+            IoUVLMRewardFunction._bge_model = None
+    
+    def get_reward_name(self) -> str:
+        return "iou_vlm"
+    
+    def compute_iou(self, box1: List[float], box2: List[float]) -> float:
+        """Calculate IoU between two boxes"""
+        x1_inter = max(box1[0], box2[0])
+        y1_inter = max(box1[1], box2[1])
+        x2_inter = min(box1[2], box2[2])
+        y2_inter = min(box1[3], box2[3])
+        
+        inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+        
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area == 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
+    @staticmethod
+    def build_transform(input_size):
+        """Build image transformation for InternVL"""
+        import torchvision.transforms as T
+        from torchvision.transforms.functional import InterpolationMode
+        
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+        
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        ])
+        return transform
+    
+    @staticmethod
+    def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+        """Find closest aspect ratio for dynamic preprocessing"""
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+    
+    @staticmethod
+    def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
+        """Dynamic preprocessing for InternVL"""
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+        
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) 
+            for i in range(1, n + 1) 
+            for j in range(1, n + 1) 
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+        
+        target_aspect_ratio = IoUVLMRewardFunction.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
+        
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+        
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        
+        return processed_images
+    
+    @staticmethod
+    def load_image_for_internvl(image, input_size=448, max_num=6):
+        """Load and preprocess image for InternVL"""
+        import torch
+        
+        transform = IoUVLMRewardFunction.build_transform(input_size=input_size)
+        images = IoUVLMRewardFunction.dynamic_preprocess(
+            image, image_size=input_size, use_thumbnail=True, max_num=max_num
+        )
+        pixel_values = [transform(img) for img in images]
+        pixel_values = torch.stack(pixel_values)
+        return pixel_values
+    
+    def generate_caption(self, image_data: str, bbox: List[float], width: int, height: int) -> str:
+        """Generate caption for the bbox region using InternVL3.5 1B"""
+        if IoUVLMRewardFunction._vlm_model is None:
+            return ""
+        
+        try:
+            import torch
+            
+            img_bytes = base64.b64decode(image_data)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = img.resize((width, height))
+            
+            x0, y0, x1, y1 = bbox
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(width, int(x1)), min(height, int(y1))
+            
+            if x0 >= x1 or y0 >= y1:
+                return ""
+            
+            cropped = img.crop((x0, y0, x1, y1))
+            
+            pixel_values = self.load_image_for_internvl(cropped, input_size=448, max_num=6)
+            pixel_values = pixel_values.to(torch.bfloat16).cuda()
+            
+            question = "<image>\nDescribe what you see in this image in one sentence."
+            
+            generation_config = dict(
+                max_new_tokens=100,
+                do_sample=False,
+            )
+            
+            with torch.no_grad():
+                response = IoUVLMRewardFunction._vlm_model.chat(
+                    IoUVLMRewardFunction._vlm_tokenizer,
+                    pixel_values,
+                    question,
+                    generation_config
+                )
+            
+            return response.strip()
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Warning: Caption generation failed: {e}")
+            return ""
+    
+    def compute_similarity(self, caption: str, query: str) -> float:
+        """Compute semantic similarity between caption and query using BGE M3"""
+        if IoUVLMRewardFunction._bge_model is None or not caption or not query:
+            return 0.0
+        
+        try:
+            import numpy as np
+            
+            caption_embedding = IoUVLMRewardFunction._bge_model.encode(
+                [caption],
+                batch_size=1,
+                max_length=512
+            )['dense_vecs']
+            
+            query_embedding = IoUVLMRewardFunction._bge_model.encode(
+                [query],
+                batch_size=1,
+                max_length=512
+            )['dense_vecs']
+            
+            similarity_matrix = caption_embedding @ query_embedding.T
+            similarity = float(similarity_matrix[0, 0])
+            
+            return max(0.0, min(1.0, similarity))
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Warning: Similarity computation failed: {e}")
+            return 0.0
+    
+    def parse_ground_truth(self, ground_truth: str) -> Optional[Dict]:
+        """Parse ground truth"""
+        answer = ground_truth["answer"]
+        resized_size = ground_truth["resized_image_size"]
+        width, height = resized_size
+        
+        objects = {}
+        for class_name, class_data in answer.items():
+            if "boxes" in class_data:
+                objects[class_name] = class_data["boxes"]
+        
+        image_data = ground_truth.get("image", None)
+        intention_query = ground_truth.get("intention_query", "")
+        
+        return {
+            "dims": (width, height),
+            "objects": objects,
+            "raw_data": answer,
+            "image": image_data,
+            "intention_query": intention_query
+        }
+    
+    def parse_detection_output(self, text: str, width: int, height: int) -> Optional[Dict]:
+        """Parse model output"""
+        try:
+            text = text.replace("\n", "").strip()
+            objects = {}
+            pattern = (
+                r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|>"
+                r"<\|box_start\|>(.*?)<\|box_end\|>"
+            )
+            
+            matches = re.findall(pattern, text)
+            
+            for class_name, boxes_str in matches:
+                class_name = class_name.strip()
+                if class_name not in objects:
+                    objects[class_name] = []
+                
+                box_pattern = r"<(\d+)>"
+                all_coords = re.findall(box_pattern, boxes_str)
+                
+                for i in range(0, len(all_coords), 4):
+                    if i + 3 < len(all_coords):
+                        try:
+                            x1, y1, x2, y2 = [int(coord) for coord in all_coords[i:i+4]]
+                            x1_abs = x1 / 1000.0 * width
+                            y1_abs = y1 / 1000.0 * height
+                            x2_abs = x2 / 1000.0 * width
+                            y2_abs = y2 / 1000.0 * height
+                            
+                            x1_final = min(x1_abs, x2_abs)
+                            y1_final = min(y1_abs, y2_abs)
+                            x2_final = max(x1_abs, x2_abs)
+                            y2_final = max(y1_abs, y2_abs)
+                            
+                            if x1_final < x2_final and y1_final < y2_final:
+                                objects[class_name].append([x1_final, y1_final, x2_final, y2_final])
+                        except (ValueError, IndexError):
+                            continue
+            
+            if not objects:
+                return None
+            
+            return {"objects": objects}
+            
+        except Exception as e:
+            if os.getenv("DEBUG_MODE") == "true":
+                print(f"Error parsing detection output: {e}")
+            return None
+    
+    def compute_reward(self, predict: str, ground_truth: Dict) -> Dict[str, float]:
+        """
+        Compute IoU + VLM Hybrid Reward
+        
+        Returns:
+            Dictionary with reward scores for WandB reporting
+        """
+        gt_parsed = self.parse_ground_truth(ground_truth)
+        if gt_parsed is None:
+            return {"overall": 0.0, "iou_vlm": 0.0, "iou": 0.0, "vlm": 0.0}
+        
+        pred_parsed = self.parse_detection_output(predict, gt_parsed["dims"][0], gt_parsed["dims"][1])
+        if pred_parsed is None:
+            return {"overall": 0.0, "iou_vlm": 0.0, "iou": 0.0, "vlm": 0.0}
+        
+        width, height = gt_parsed["dims"]
+        image_data = gt_parsed["image"]
+        intention_query = gt_parsed["intention_query"]
+        
+        # Compute IoU Reward
+        all_ious = []
+        for gt_class, gt_boxes in gt_parsed["objects"].items():
+            if gt_class in pred_parsed["objects"]:
+                pred_boxes = pred_parsed["objects"][gt_class]
+                for gt_box in gt_boxes:
+                    max_iou_for_gt = 0.0
+                    for pred_box in pred_boxes:
+                        iou = self.compute_iou(pred_box, gt_box)
+                        max_iou_for_gt = max(max_iou_for_gt, iou)
+                    all_ious.append(max_iou_for_gt)
+        
+        avg_iou = sum(all_ious) / len(all_ious) if all_ious else 0.0
+        iou_reward = 1.0 if avg_iou > self.iou_threshold else 0.0
+        
+        # Compute VLM Semantic Reward
+        vlm_reward = 0.0
+        max_similarity = 0.0
+        best_caption = ""
+        
+        if image_data and intention_query and IoUVLMRewardFunction._vlm_model is not None:
+            all_pred_boxes = []
+            for class_boxes in pred_parsed["objects"].values():
+                all_pred_boxes.extend(class_boxes)
+            
+            if all_pred_boxes:
+                for bbox in all_pred_boxes:
+                    caption = self.generate_caption(image_data, bbox, width, height)
+                    if caption:
+                        similarity = self.compute_similarity(caption, intention_query)
+                        if similarity > max_similarity:
+                            max_similarity = similarity
+                            best_caption = caption
+                
+                vlm_reward = 1.0 if max_similarity > self.vlm_threshold else 0.0
+        
+        # Combined reward
+        hybrid_reward = self.alpha * iou_reward + self.beta * vlm_reward
+        
+        # Debug logging
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            if log_path:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"------------- IoU+VLM Hybrid Reward: {hybrid_reward:.3f} -------------\n")
+                    f.write(f"IoU Reward: {iou_reward:.1f} (avg IoU: {avg_iou:.3f}, threshold: {self.iou_threshold})\n")
+                    f.write(f"VLM Reward: {vlm_reward:.1f} (similarity: {max_similarity:.3f}, threshold: {self.vlm_threshold})\n")
+                    f.write(f"Weights: alpha={self.alpha}, beta={self.beta}\n")
+                    f.write(f"Best Caption: {best_caption}\n")
+                    f.write(f"Intention Query: {intention_query}\n")
+                    f.write(f"Prediction: {predict}\n\n")
+        
+        return {
+            "overall": hybrid_reward,
+            "iou_vlm": hybrid_reward,
+            "iou": iou_reward,
+            "vlm": vlm_reward,
+            "avg_iou": avg_iou,
+            "similarity": max_similarity
+        }
+
+
+# Register IoU + VLM hybrid reward function
+RewardFunctionFactory.register("iou_vlm", IoUVLMRewardFunction)
+
+
 def compute_score(
     predicts: List[str], ground_truths: List[str]
 ) -> List[Dict[str, float]]:

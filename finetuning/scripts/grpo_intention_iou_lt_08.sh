@@ -1,26 +1,20 @@
 #!/bin/bash
 
 # ========================================
-# GRPO Training Script with IoU Reward for OV-IGOD
+# GRPO Training Script for Filtered Intention Datasets
+# Using samples with IoU < 0.8 (poorly predicted samples)
+# Total: 9,055 samples (COCO: 2,342, ScanNet: 3,954, EgoObject: 2,759)
 # ========================================
-# Pure IoU reward (box_iou), no CLIP semantic reward
-# Full OV-IGOD train set, no data filtering
-#
-# Pipeline:
-#   1. SFT on OV-IGOD train set (sft_ovigod.sh)
-#   2. GRPO with IoU reward on full train set (this script)
-#
-# Usage:
-#   bash scripts/grpo_ovigod.sh
+# This script runs GRPO (reinforcement learning) on top of the SFT checkpoint
 
-export OUTPUT_PATH="work_dirs/ovigod_grpo_iou"
-export EXP_NAME="ovigod_grpo_iou"
-export DEBUG_MODE="true"
+export OUTPUT_PATH="work_dirs/intention_grpo_iou_lt_08"
+export EXP_NAME="intention_grpo_iou_lt_08"
+export DEBUG_MODE="true"  # Enable debug logging to monitor rewards
 export LOG_PATH="${OUTPUT_PATH}/log.txt"
 export LOG_VISUALIZE_PATH="${OUTPUT_PATH}/visualizations"
 
 # Data loading configuration
-NUM_WORKERS=16
+NUM_WORKERS=16  # Number of data loading workers
 
 # Create output directories
 mkdir -p ${OUTPUT_PATH}
@@ -42,34 +36,39 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 # Clear any Ray temp files
 rm -rf /tmp/ray/* 2>/dev/null || true
 
-# =============================================
-# SET THESE BEFORE RUNNING
-# =============================================
-# Path to SFT checkpoint (output of sft_ovigod.sh)
-MODEL_PATH="work_dirs/ovigod_sft_3ep"
+# Your best SFT checkpoint path (使用3 epochs训练的checkpoint)
+MODEL_PATH="/home/hairong/hairong/code/IntentionDetection/finetuning/work_dirs/intention_sft_3epochs"
 
-# GPU to use
-export CUDA_VISIBLE_DEVICES=1
+# Set CUDA device (use GPU 2)
+export CUDA_VISIBLE_DEVICES=2
 
 # Wandb settings
-export WANDB_PROJECT="rex-omni-grpo-ovigod"
+export WANDB_PROJECT="rex-omni-grpo-intention"
+export WANDB_API_KEY="d0891adc2fc5fb80fce98ca48404b2dca194cd8c"
 
 echo "========================================="
-echo "GRPO Training with IoU Reward - OV-IGOD"
+echo "GRPO Training for Filtered Intention Datasets"
 echo "========================================="
 echo "Starting from SFT checkpoint: ${MODEL_PATH}"
 echo "Output will be saved to: ${OUTPUT_PATH}"
 echo "Debug logs: ${LOG_PATH}"
+echo "Visualizations: ${LOG_VISUALIZE_PATH}"
 echo ""
-echo "Reward: Pure IoU (box_iou)"
-echo "Dataset: OV-IGOD full train set (6701 images, 15430 samples)"
-echo "  - No data filtering, use all samples"
+echo "Filtered Datasets (IoU < 0.8):"
+echo "  - COCO Outdoor: 2,342 samples (29.28% of original)"
+echo "  - ScanNet: 3,954 samples (53.56% of original)"
+echo "  - EgoObject: 2,759 samples (23.93% of original)"
+echo "  Total: 9,055 samples (33.65% of 26,911)"
+echo ""
+echo "Strategy: Focus on poorly predicted samples"
+echo "  - IoU < 0.8: Samples where SFT model needs improvement"
+echo "  - Target: Improve predictions on difficult cases"
 echo "========================================="
 echo ""
 
 python3 -m verl.trainer.main \
-    config=configs/grpo_ovigod.yaml \
-    data.config_path="configs/grpo_ovigod.py" \
+    config=configs/grpo_intention_datasets.yaml \
+    data.config_path="configs/sft_intention_datasets_grpo.py" \
     data.num_workers=${NUM_WORKERS} \
     data.format_prompt="verl/configs/r1v_format.jinja" \
     worker.actor.model.model_path=${MODEL_PATH} \
@@ -81,21 +80,22 @@ python3 -m verl.trainer.main \
     worker.actor.micro_batch_size_per_device_for_experience=4 \
     worker.rollout.n=4 \
     worker.rollout.temperature=1.0 \
-    worker.rollout.gpu_memory_utilization=0.65 \
+    worker.rollout.gpu_memory_utilization=0.6 \
     trainer.total_epochs=1 \
     trainer.save_checkpoint_path=${OUTPUT_PATH} \
-    trainer.save_freq=500 \
+    trainer.save_freq=100 \
     trainer.save_limit=5
 
 echo ""
 echo "========================================="
-echo "GRPO training with IoU Reward completed!"
+echo "GRPO training completed!"
 echo "========================================="
 echo "Checkpoints saved in: ${OUTPUT_PATH}"
 echo "Review reward logs in: ${LOG_PATH}"
+echo "Visualizations in: ${LOG_VISUALIZE_PATH}"
 echo ""
 echo "Next steps:"
-echo "1. Convert checkpoint: python convert_grpo_to_hf.py --checkpoint_path ${OUTPUT_PATH}/global_step_XXX/actor"
-echo "2. Evaluate: python evaluate_ovigod_single_query.py --checkpoint ${OUTPUT_PATH}/global_step_XXX/actor/huggingface"
-echo "3. Compare with Dual Reward GRPO (grpo_ovigod_dual_reward.sh)"
+echo "1. Evaluate the GRPO checkpoint on test sets"
+echo "2. Compare with SFT baseline (intention_sft_3epochs)"
+echo "3. Check if performance improved on IoU < 0.8 samples"
 echo ""

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 
 import ray
 from omegaconf import OmegaConf
@@ -118,16 +119,29 @@ def main():
     ppo_config.deep_post_init()
 
     if not ray.is_initialized():
-        runtime_env = {
-            "env_vars": {
-                "TOKENIZERS_PARALLELISM": "true",
-                "NCCL_DEBUG": "WARN",
-                "VLLM_LOGGING_LEVEL": "WARN",
-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
-                "PYTHONUNBUFFERED": "1",
-            }
+        # Prepare runtime environment with all necessary env vars
+        env_vars = {
+            "TOKENIZERS_PARALLELISM": "true",
+            "NCCL_DEBUG": "WARN",
+            "VLLM_LOGGING_LEVEL": "WARN",
+            "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            "PYTHONUNBUFFERED": "1",
         }
+        
+        # Pass through CUDA_VISIBLE_DEVICES if set (for VLM reward functions)
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            env_vars["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+            print(f"🔍 Passing CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} to Ray workers")
+        
+        # Pass through VLM and BGE model names if set
+        for key in ["VLM_MODEL_NAME", "BGE_MODEL_NAME", "DEBUG_MODE", 
+                    "VLM_SIMILARITY_THRESHOLD", "IOU_VLM_ALPHA", "IOU_VLM_BETA",
+                    "IOU_VLM_IOU_THRESHOLD", "IOU_VLM_VLM_THRESHOLD"]:
+            if key in os.environ:
+                env_vars[key] = os.environ[key]
+        
+        runtime_env = {"env_vars": env_vars}
         ray.init(runtime_env=runtime_env)
 
     runner = Runner.remote()

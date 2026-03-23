@@ -1,27 +1,35 @@
 #!/bin/bash
 
+# ========================================
+# Rex-Omni SFT Training Script
+# Three Intention Datasets
+# ========================================
+export CUDA_VISIBLE_DEVICES=3
 NNODES=1
-GPUS_PER_NODE=1  # 使用单张GPU
+GPUS_PER_NODE=1  # 根据实际GPU数量调整
 
 export MASTER_ADDR=localhost
 export MASTER_PORT=29500
-export WANDB_PROJECT="rex-omni-ovigod"  # 自定义 wandb project 名称
 
-run_name="rexomni_ovigod_affordance-3ep"
+# WandB 配置
+export WANDB_API_KEY="d0891adc2fc5fb80fce98ca48404b2dca194cd8c"
+export WANDB_PROJECT="rex-omni-intention"  # 项目名称
+
+run_name="rexomni_intention_sft"
 
 torchrun \
     --nnodes=${NNODES} \
     --nproc_per_node=${GPUS_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} train.py \
-    --config configs/sft_ovigod.py \
+    --config configs/sft_intention_datasets.py \
     --deepspeed scripts/zero2.json \
     --data_flatten False \
     --tune_mm_vision True \
     --tune_mm_mlp True \
     --tune_mm_llm True \
     --bf16 \
-    --output_dir work_dirs/ovigod_sft_3ep \
+    --output_dir work_dirs/intention_sft_3epochs \
     --num_train_epochs 3 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 8 \

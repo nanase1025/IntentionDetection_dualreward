@@ -478,6 +478,26 @@ class TSVRLHFDataset(Dataset, ImageProcessMixin):
         data_dict["raw_prompt_ids"] = raw_prompt_ids
         data_dict["ground_truth"] = json.loads(data_dict.pop("answer"))
         data_dict["ground_truth"]["reward_name"] = self.reward_name
+        
+        # Add image and intention_query for dual reward
+        if self.reward_name == "dual":
+            # Convert PIL image to base64 string for CLIP
+            import base64
+            from io import BytesIO
+            
+            img_buffer = BytesIO()
+            image_pil.save(img_buffer, format='JPEG')
+            img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            data_dict["ground_truth"]["image"] = img_base64
+            
+            # Extract intention_query from prompt (remove <image> tag)
+            prompt_text = data_dict.get("prompt", "")
+            intention_query = prompt_text.replace("<image>", "").strip()
+            # Remove common prompt patterns to extract just the intention
+            if intention_query.startswith("The intention is:"):
+                intention_query = intention_query.replace("The intention is:", "").strip()
+            data_dict["ground_truth"]["intention_query"] = intention_query
+        
         return data_dict
 
 

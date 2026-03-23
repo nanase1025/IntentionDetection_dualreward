@@ -12,9 +12,9 @@ model_name_or_path = "IDEA-Research/Rex-Omni"
 # OV-IGOD 数据集配置 - 基于意图/功能描述的目标检测
 ovigod_data = dict(
     type=GroundingTSVDataset,
-    img_tsv_file="/workspace/hairong/data/ov-igod-dataset/train.images.tsv",
-    ann_tsv_file="/workspace/hairong/data/ov-igod-dataset/train.annotations.tsv",
-    ann_lineidx_file="/workspace/hairong/data/ov-igod-dataset/train.annotations.tsv.lineidx",
+    img_tsv_file="/home/hairong/hairong/data/ov-igod-dataset/train.images.tsv",
+    ann_tsv_file="/home/hairong/hairong/data/ov-igod-dataset/train.annotations.tsv",
+    ann_lineidx_file="/home/hairong/hairong/data/ov-igod-dataset/train.annotations.tsv.lineidx",
     image_min_pixels=min_pixels,
     image_max_pixels=max_pixels,
     max_num_samples=None,  # 快速测试：只使用1000个样本（设为None则使用全部6701个）

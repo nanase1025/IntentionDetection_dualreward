@@ -196,13 +196,13 @@ def main():
     parser.add_argument(
         "--test_json",
         type=str,
-        default="/workspace/hairong/data/ov-igod-dataset/test.json",
+        default="/home/hairong/hairong/code/ov-igod-dataset/test.json",
         help="Path to test set JSON file"
     )
     parser.add_argument(
         "--image_root",
         type=str,
-        default="/workspace/hairong/data/ov-igod-dataset/sunrgbd_jpgs",
+        default="/home/hairong/hairong/code/ov-igod-dataset/sunrgbd_jpgs",
         help="Root directory of images"
     )
     parser.add_argument(

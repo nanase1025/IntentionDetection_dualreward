@@ -208,7 +208,7 @@ def evaluate_at_iou_threshold(all_predictions, all_ground_truths, iou_threshold)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate model on OV-IGOD test set - Per-Affordance AP metrics")
+    parser = argparse.ArgumentParser(description="Evaluate model on OV-IGOD test set - AP metrics")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -218,13 +218,13 @@ def main():
     parser.add_argument(
         "--test_json",
         type=str,
-        default="/workspace/hairong/data/ov-igod-dataset/test.json",
+        default="/home/hairong/hairong/code/ov-igod-dataset/test.json",
         help="Path to test set JSON file"
     )
     parser.add_argument(
         "--image_root",
         type=str,
-        default="/workspace/hairong/data/ov-igod-dataset/sunrgbd_jpgs",
+        default="/home/hairong/hairong/code/ov-igod-dataset/sunrgbd_jpgs",
         help="Root directory of images"
     )
     parser.add_argument(
@@ -236,7 +236,7 @@ def main():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="evaluation_ap_per_affordance_results.json",
+        default="evaluation_ap_results.json",
         help="Path to save evaluation results"
     )
     parser.add_argument(
@@ -250,13 +250,13 @@ def main():
         "--batch_size",
         type=int,
         default=1,
-        help="Batch size for inference"
+        help="Batch size for inference (use >1 for faster processing)"
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=1,
-        help="Number of worker processes for data loading"
+        help="Number of worker processes for data loading (use >1 for parallel processing)"
     )
     
     args = parser.parse_args()
